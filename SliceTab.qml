@@ -45,6 +45,10 @@ Item {
   // counted while the in-compositor watcher has not acknowledged.
   property int fallbackAltTicks: 0
   property int selectedIndex: 0
+  // Presses counted within one physical Alt hold. Index 0 of the row is the
+  // window that had focus when the hold began, so a single press must land on
+  // 1 for a bare Alt+Tab to reach the previous window.
+  property int burstStep: 0
 
   // Injected by omarchy-shell after load. Both stay null under a host that
   // does not provide them, and every read below survives that.
@@ -136,13 +140,11 @@ Item {
     return null
   }
 
-  // `bring_to_top()` rotates Hyprland's window vector after every native
-  // cycle. `hyprctl clients` exposes that vector, so blindly publishing every
-  // snapshot would leave the active window at the final index on every press:
-  // the label would keep saying N / N and the cards would exchange identities
-  // around a stationary selection. Center the first accepted snapshot, then
-  // keep that circular order for the rest of the physical Alt hold while still
-  // replacing every entry with its freshly read metadata.
+  // Two jobs. On the first accepted snapshot of a hold, order the row by
+  // Hyprland's focus history so it reads most-recently-used first. For every
+  // later snapshot of the same hold, keep that order untouched while still
+  // replacing each entry with its freshly read metadata -- the row must never
+  // reshuffle under a selection the user is stepping through.
   function orderedWindowSnapshot(list, focusedAddress) {
     if (root.opened && root.windows.length === list.length) {
       var freshByAddress = ({})
@@ -161,14 +163,21 @@ Item {
       if (stable.length === list.length) return stable
     }
 
-    var at = list.findIndex(function(w) { return w.address === focusedAddress })
-    if (at < 0 || list.length < 2) return list
-    var before = Math.min(root.sideSlices, Math.floor((list.length - 1) / 2))
-    var start = (at - before + list.length) % list.length
-    var centered = []
-    for (var k = 0; k < list.length; k++)
-      centered.push(list[(start + k) % list.length])
-    return centered
+    // Fresh hold. The workspace filter has already run, so these ranks are
+    // sparse; only their relative order matters.
+    var byRank = list.slice()
+    byRank.sort(function(a, b) { return a.focusRank - b.focusRank })
+    // The read establishes which window holds focus, and index 0 has to be
+    // that window for burstStep to mean what it says. Hyprland's history
+    // agrees in every ordinary case; when it does not, the read wins.
+    if (byRank.length > 1 && byRank[0].address !== focusedAddress) {
+      var head = byRank.filter(function(w) { return w.address === focusedAddress })
+      if (head.length === 1)
+        byRank = head.concat(byRank.filter(function(w) {
+          return w.address !== focusedAddress
+        }))
+    }
+    return byRank
   }
 
   // Only the screen from the accepted snapshot counts. If it is no longer
@@ -287,24 +296,34 @@ Item {
           list.push({
             address: addr,
             title: String(c.title || ""),
-            cls: String(c.class || "")
+            cls: String(c.class || ""),
+            // Hyprland's own MRU rank: 0 is the focused window, 1 the one
+            // focused before it. A client without the field sorts last rather
+            // than jumping to the front of the row.
+            focusRank: typeof c.focusHistoryID === "number"
+              ? c.focusHistoryID : Number.MAX_SAFE_INTEGER
           })
         }
-        // Hyprland's native cycle and `hyprctl clients` use the same circular
-        // window vector. Keep one stable rotation of that vector during this
-        // Alt hold so the displayed position can actually advance.
+        // Most-recently-used first, then frozen for the rest of the hold.
         list = root.orderedWindowSnapshot(list, focusedAddress)
         root.currentWorkspace = workspaceName
         root.currentWorkspaceId = workspaceId
         root.currentMonitorId = monitorId
         root.windows = list
 
-        // The selection follows Hyprland; it does not drive it. A window that is
-        // no longer in the list (-1) selects the first one, as before.
-        var at = list.findIndex(function(w) { return w.address === focusedAddress })
-        root.selectedIndex = at < 0 ? 0 : at
+        // The selection drives Hyprland now instead of following it: focus does
+        // not move until Alt is released, so the compositor cannot be asked
+        // where the row stands. burstStep counts the presses of this hold.
+        root.selectedIndex = root.stepToIndex(list.length)
         root.opened = list.length > 0
         if (root.opened) safetyTimer.restart()
+        // A release that beat this read parked itself; finish it now that there
+        // is a row to commit. Also reached with an empty list, which is what
+        // releases the park instead of leaving it set forever.
+        if (root.pendingReleaseToken) {
+          if (root.ownsBurst(root.pendingReleaseToken)) root.commitRelease()
+          else root.pendingReleaseToken = ""
+        }
       }
     }
   }
@@ -380,6 +399,8 @@ Item {
     burstToken = ""
     burstOriginToken = ""
     burstAnchorAddress = ""
+    burstStep = 0
+    pendingReleaseToken = ""
     pendingWatchToken = ""
     watchRetryUsed = false
     watchNeedsFallback = false
@@ -485,6 +506,9 @@ Item {
   // and this IpcHandler does not exist.
   property string burstToken: ""
   property string burstOriginToken: ""
+  // Set when Alt is released before the first read of that hold has landed.
+  // The next read commits it. See release() and commitRelease().
+  property string pendingReleaseToken: ""
   property int burstSequence: 0
   readonly property double watchEpoch: Date.now()
   readonly property string watchOwner: String(Quickshell.processId) + "-"
@@ -567,8 +591,8 @@ Item {
     // backward before either of these runs, so the plugin only re-reads the
     // result. They stay separate because they are the public IPC names the two
     // key bindings in README.md call.
-    function next(): void { root.notifyNativeCycle() }
-    function prev(): void { root.notifyNativeCycle() }
+    function next(): void { root.notifyTabPress(1) }
+    function prev(): void { root.notifyTabPress(-1) }
 
     // Called by the Hyprland timer once Alt has been held past the threshold.
     // The token is the burst token, not the per-Tab one, because the whole
@@ -580,8 +604,20 @@ Item {
 
     // Called by the Hyprland timer as soon as Alt is actually released. A late
     // message from a previous sequence must not remove the list for a new one.
+    //
+    // The release is also the commit: focus has not moved during the hold, so
+    // this is where the selected window finally receives it. Escape never gets
+    // here -- it stops the in-compositor timer before the release can fire.
     function release(token: string): void {
-      if (root.ownsBurst(token)) root.close()
+      if (!root.ownsBurst(token)) return
+      // A tap can be shorter than one `hyprctl clients` read. Park the release
+      // rather than committing an empty row; requestWindows() always ran for
+      // this burst, so a read is on its way to pick it up.
+      if (root.count === 0) {
+        root.pendingReleaseToken = token
+        return
+      }
+      root.commitRelease()
     }
 
     // Escape while holding. Same ownership test: a late message from a previous
@@ -666,21 +702,48 @@ Item {
       " return true end)()")
   }
 
-  function notifyNativeCycle() {
+  // Wraps burstStep onto a row of `length` entries. Negative steps (Shift)
+  // wrap from the other end, which the plain % operator does not do.
+  function stepToIndex(length) {
+    if (length <= 0) return 0
+    return ((root.burstStep % length) + length) % length
+  }
+
+  // Focus moved during the hold before, so the release only had to tear the row
+  // down. It now carries the whole switch: nothing has moved until here.
+  function commitRelease() {
+    var target = root.selectedWindow
+    var current = root.clientAddress(root.observedActiveAddress)
+    // Selecting the window that already has focus is a no-op worth skipping: a
+    // hold with no Tab in it, or a workspace with a single window.
+    if (target && root.clientAddress(target.address) !== current)
+      root.focusWindow(target.address)
+    root.close()
+  }
+
+  function notifyTabPress(direction) {
     if (!root.hyprApiSupported) return
+    var step = direction >= 0 ? 1 : -1
     var newBurst = !root.burstToken
     root.burstSequence = (root.burstSequence + 1) % 1000000000
     root.burstToken = root.watchOwner + "-" + root.burstSequence
     if (newBurst) {
       root.burstOriginToken = root.burstToken
-      // The stock cycle ran first, so the raw activewindowv2 transition already
-      // contains the window from which this physical Alt sequence started.
-      root.burstAnchorAddress = root.previouslyActiveAddress
+      // Focus no longer moves on the press, so the window the hold started from
+      // is simply the one holding focus now. Escape restoring to it is a no-op,
+      // which is correct: there is nothing to undo.
+      root.burstAnchorAddress = root.observedActiveAddress
+      root.burstStep = step
       root.watchRetryUsed = false
       // close() already clears both, and a new burst can only follow a close.
       // Stated again here so the burst start owns its own preconditions.
       root.revealed = false
       root.fallbackAltTicks = 0
+    } else {
+      root.burstStep += step
+      // The order is frozen for this hold, so the selection can advance right
+      // away instead of waiting for the read that only confirms it.
+      root.selectedIndex = root.stepToIndex(root.count)
     }
     root.requestWindows()
     // Cover the interval before the in-compositor watcher acknowledges that it
